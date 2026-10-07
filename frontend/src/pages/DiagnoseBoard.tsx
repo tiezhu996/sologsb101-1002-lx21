@@ -7,6 +7,7 @@ import { useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   App as AntdApp,
+  Alert,
   Button,
   Card,
   Col,
@@ -19,6 +20,7 @@ import {
   Space,
   Table,
   Tag,
+  Tooltip,
   Typography,
 } from 'antd';
 import {
@@ -48,6 +50,7 @@ export default function DiagnoseBoard() {
   const { message } = AntdApp.useApp();
   const thresholds = useSampleStore((state) => state.thresholds);
   const samplesOfString = useSampleStore((state) => state.samplesOfString);
+  const curtailPeriods = useSampleStore((state) => state.curtailPeriods);
   const markedStringIds = useSampleStore((state) => state.markedStringIds);
   const toggleMark = useSampleStore((state) => state.toggleMark);
   const markMany = useSampleStore((state) => state.markMany);
@@ -255,6 +258,15 @@ export default function DiagnoseBoard() {
         countUnit="串"
       />
 
+      {curtailPeriods.length > 0 ? (
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginTop: 12 }}
+          message={`已登记 ${curtailPeriods.length} 个限功率时段：受限采集点按实际限值折算还原（非整段剔除），再进入归一化与同箱基准；跨日时段直接生效，重叠取最严限值，未填结束时间顺延至当前批次末尾。`}
+        />
+      ) : null}
+
       <Row gutter={14} style={{ marginTop: 14 }}>
         <Col xs={24} xl={16}>
           <Card size="small" title="组串排查榜（离散率 / 电流偏差）" styles={{ body: { padding: 12 } }}>
@@ -290,13 +302,20 @@ export default function DiagnoseBoard() {
                   },
                   {
                     title: '组串',
-                    width: 170,
+                    width: 200,
                     render: (_, row) => (
                       <Space size={6}>
                         <span>
                           {row.combinerBox} · {row.stringCode}
                         </span>
                         {markedStringIds.includes(row.stringId) ? <StarOutlined style={{ color: '#faad14' }} /> : null}
+                        {row.curtailApplied ? (
+                          <Tooltip title="窗口内存在限功率时段采集点，电流已按实际限值折算还原">
+                            <Tag color="purple" style={{ marginInlineEnd: 0 }}>
+                              限电折算
+                            </Tag>
+                          </Tooltip>
+                        ) : null}
                       </Space>
                     ),
                   },
@@ -399,9 +418,18 @@ export default function DiagnoseBoard() {
                         <Button type="link" size="small" onClick={() => setDetailId(stat.stringId)}>
                           {stat.combinerBox} · {stat.stringCode}
                         </Button>
-                        <span>
-                          {DISCRETE_LEVEL_LABEL[stat.level]} {stat.discreteRate.toFixed(2)}%
-                        </span>
+                        <Space size={4}>
+                          {stat.curtailApplied ? (
+                            <Tooltip title="含限功率时段，已按实际限值折算">
+                              <Tag color="purple" style={{ marginInlineEnd: 0 }}>
+                                限电
+                              </Tag>
+                            </Tooltip>
+                          ) : null}
+                          <span>
+                            {DISCRETE_LEVEL_LABEL[stat.level]} {stat.discreteRate.toFixed(2)}%
+                          </span>
+                        </Space>
                       </Space>
                       <Progress
                         percent={Math.min(100, stat.discreteRate * 6)}
@@ -513,8 +541,8 @@ export default function DiagnoseBoard() {
                         ),
                       },
                       {
-                        title: '归一化电流',
-                        dataIndex: 'avgNormalizedCurrentA',
+                        title: '折算后归一化电流',
+                        dataIndex: 'avgAdjustedCurrentA',
                         render: (value: number) => formatCurrent(value),
                       },
                       {

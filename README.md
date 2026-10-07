@@ -26,6 +26,7 @@ docker compose up -d --build # 代码改动后重建
 - 录入电站与方阵结构（装机容量、并网日期、纬度、倾角、方位角）
 - 维护逆变器 / 汇流箱 / 组串三级设备台账，支持批量新增组串
 - 采集组串电流、电压、辐照度，按汇流箱分组实时计算**离散率**（标准差 / 均值），辐照度不同自动做归一化修正
+- 在电站页登记**逆变器限功率时段与限值**：限电会把同逆变器组串电流一起压低，受限采集点按**实际限值折算还原**（非整段剔除）后再统计，支持跨日、重叠取最严限值、未填结束时间顺延至当前批次末尾
 - 在失配排查工作台按离散率与电流偏差排序、人工标记可疑组串、追溯同汇流箱与同逆变器对比
 - 下发处置单并回填复测电流，复测达基准 95% 自动判定消缺
 - 配置判定阈值、查看 IndexedDB 结构版本并做整库 JSON 导出 / 导入
@@ -88,7 +89,7 @@ sologsb101-1002/
 ## 六、数据存储说明
 
 - **存储介质**：浏览器 IndexedDB，库名 **`gbpvstring`**，通过 Dexie 4.x 封装。
-- **数据结构版本**：`utils/db.ts` 中 `DB_SCHEMA_VERSION = 2`，并登记了 v1 → v2 的 `upgrade` 迁移（补齐行修订号 `revision`、迁移旧字段 `combinerNo → combinerBox`、写入默认阈值）。
+- **数据结构版本**：`utils/db.ts` 中 `DB_SCHEMA_VERSION = 3`，并登记了 v1 → v2 的 `upgrade` 迁移（补齐行修订号 `revision`、迁移旧字段 `combinerNo → combinerBox`、写入默认阈值）；v3 新增 `curtailPeriods` 限功率时段表（仅新增表，历史数据无需行迁移）。
 - **数据表**：
 
   | 表名 | 实体 | 主要索引 |
@@ -99,9 +100,10 @@ sologsb101-1002/
   | `strings` | 组串 | id / inverterId / combinerBox / code / moduleModel |
   | `samples` | 采集读数 | id / stringId / sampledAt / [stringId+sampledAt] |
   | `disposals` | 处置单 | id / stringId / state / type / owner / dueDate |
+  | `curtailPeriods` | 逆变器限功率时段 | id / plantId / inverterId / startAt / endAt |
   | `settings` | 阈值配置 | id（固定 `threshold`） |
 
-- **首屏自动播种**：`initDatabase()` 在 `plants` 表为空时写入演示数据（幂等）——2 个电站 × 各 2 个方阵 × 各 1~2 台逆变器 × 若干汇流箱与组串 × 每串 4 个采集点 + 5 张处置单，父子记录通过 `plantId / arrayId / inverterId / stringId` 互相引用。
+- **首屏自动播种**：`initDatabase()` 在 `plants` 表为空时写入演示数据（幂等）——2 个电站 × 各 2 个方阵 × 各 1~2 台逆变器 × 若干汇流箱与组串 × 每串 4 个采集点 + 5 张处置单 + 限功率时段示例（60% 闭合时段 / 70% 未填结束时段），父子记录通过 `plantId / arrayId / inverterId / stringId` 互相引用。
 - **跨页状态**：全部放在 Zustand store（`plantStore / deviceStore / sampleStore / disposalStore`），页面只读 store；Dexie 写入后由 `utils/events.ts` 广播，各 store 自动重新拉取。
 - **数据不出浏览器**：容器无状态，不挂载卷、不使用数据库服务。
 

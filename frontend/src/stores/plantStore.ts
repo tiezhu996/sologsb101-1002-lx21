@@ -7,20 +7,25 @@ import {
   ROW_REVISION,
   initDatabase,
   listArrays,
+  listCurtailPeriods,
   listDisposals,
   listInverters,
   listPlants,
   listSamples,
   listStrings,
   putArray,
+  putCurtailPeriod,
   putPlant,
   removeArray,
+  removeCurtailPeriod,
   removePlant,
   type ArrayRow,
+  type CurtailPeriodDbRow,
   type PlantRow,
 } from '../utils/db';
 import type { ArrayDraft, Array as PvArray } from '../types/array';
 import type { PlantDraft, PlantSummary } from '../types/plant';
+import type { CurtailDraft } from '../types/curtail';
 import { nowIso, uuid } from '../utils/format';
 import { emitChange, subscribeChange } from '../utils/events';
 
@@ -28,6 +33,8 @@ interface PlantStoreState {
   plants: PlantRow[];
   arrays: ArrayRow[];
   summaries: PlantSummary[];
+  /** 全部限功率时段（电站页登记：时段 + 逆变器限值） */
+  curtailPeriods: CurtailPeriodDbRow[];
   activePlantId: string | null;
   loading: boolean;
   error: string;
@@ -41,6 +48,10 @@ interface PlantStoreState {
   createArray: (draft: ArrayDraft) => Promise<ArrayRow>;
   updateArray: (arrayId: string, draft: ArrayDraft) => Promise<void>;
   deleteArray: (arrayId: string) => Promise<void>;
+  createCurtailPeriod: (draft: CurtailDraft) => Promise<CurtailPeriodDbRow>;
+  updateCurtailPeriod: (id: string, draft: CurtailDraft) => Promise<void>;
+  deleteCurtailPeriod: (id: string) => Promise<void>;
+  curtailPeriodsOfPlant: (plantId: string) => CurtailPeriodDbRow[];
   arraysOfPlant: (plantId: string) => ArrayRow[];
   activePlant: () => PlantRow | null;
 }
@@ -50,14 +61,16 @@ async function loadSummaries(): Promise<{
   plants: PlantRow[];
   arrays: ArrayRow[];
   summaries: PlantSummary[];
+  curtailPeriods: CurtailPeriodDbRow[];
 }> {
-  const [plants, arrays, inverters, strings, samples, disposals] = await Promise.all([
+  const [plants, arrays, inverters, strings, samples, disposals, curtailPeriods] = await Promise.all([
     listPlants(),
     listArrays(),
     listInverters(),
     listStrings(),
     listSamples(),
     listDisposals(),
+    listCurtailPeriods(),
   ]);
   const summaries: PlantSummary[] = plants.map((plant) => {
     const plantArrays = arrays.filter((item) => item.plantId === plant.id);
@@ -90,7 +103,7 @@ async function loadSummaries(): Promise<{
       alarmStringCount: alarmIds.size,
     };
   });
-  return { plants, arrays, summaries };
+  return { plants, arrays, summaries, curtailPeriods };
 }
 
 let unsubscribe: (() => void) | null = null;
@@ -99,6 +112,7 @@ export const usePlantStore = create<PlantStoreState>((set, get) => ({
   plants: [],
   arrays: [],
   summaries: [],
+  curtailPeriods: [],
   activePlantId: null,
   loading: false,
   error: '',
@@ -122,11 +136,12 @@ export const usePlantStore = create<PlantStoreState>((set, get) => ({
 
   async loadPlants() {
     try {
-      const { plants, arrays, summaries } = await loadSummaries();
+      const { plants, arrays, summaries, curtailPeriods } = await loadSummaries();
       set((state) => ({
         plants,
         arrays,
         summaries,
+        curtailPeriods,
         error: '',
         activePlantId:
           state.activePlantId && plants.some((item) => item.id === state.activePlantId)
@@ -210,6 +225,47 @@ export const usePlantStore = create<PlantStoreState>((set, get) => ({
   async deleteArray(arrayId) {
     await removeArray(arrayId);
     emitChange();
+  },
+
+  async createCurtailPeriod(draft) {
+    const row: CurtailPeriodDbRow = {
+      id: uuid(),
+      plantId: draft.plantId,
+      inverterId: draft.inverterId,
+      startAt: draft.startAt,
+      endAt: draft.endAt,
+      limitPercent: draft.limitPercent,
+      createdAt: nowIso(),
+      revision: ROW_REVISION,
+    };
+    await putCurtailPeriod(row);
+    emitChange();
+    return row;
+  },
+
+  async updateCurtailPeriod(id, draft) {
+    const existing = get().curtailPeriods.find((item) => item.id === id);
+    if (!existing) return;
+    await putCurtailPeriod({
+      ...existing,
+      plantId: draft.plantId,
+      inverterId: draft.inverterId,
+      startAt: draft.startAt,
+      endAt: draft.endAt,
+      limitPercent: draft.limitPercent,
+    });
+    emitChange();
+  },
+
+  async deleteCurtailPeriod(id) {
+    await removeCurtailPeriod(id);
+    emitChange();
+  },
+
+  curtailPeriodsOfPlant(plantId) {
+    return get()
+      .curtailPeriods.filter((item) => item.plantId === plantId)
+      .sort((a, b) => a.startAt.localeCompare(b.startAt));
   },
 
   arraysOfPlant(plantId) {

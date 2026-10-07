@@ -67,12 +67,25 @@ export function groupKeyOf(row: { inverterId: string; combinerBox: string }): st
 }
 
 /**
+ * 采集点 → 折算电流的取数器。
+ * 传入时按「限功率实际限值折算后的电流」进入归一化；不传则直接使用原始读数。
+ * 参数为 stringId + 该条采集记录，返回该点用于统计的电流（A）。
+ */
+export type SampleCurrentAdjuster = (stringId: string, sample: Sample) => number;
+
+/** 标记某组串窗口内是否命中限电时段（用于榜单标注） */
+export type SampleCurtailMarker = (stringId: string, sample: Sample) => boolean;
+
+/**
  * 由采集记录聚合出组串离散率榜。
- * 同一汇流箱内的组串电流互为基准，逐组串计算离散率与电流偏差。
+ * 同一汇流箱内的组串电流互为基准：离散率按窗口内逐点电流计算，电流偏差相对同箱均值；
+ * 限功率时段的采集点先经 adjuster 按实际限值折算还原，避免正常组串被压低后误推上失配榜。
  */
 export function buildStringStats(
   samples: Sample[],
   config: ThresholdConfig = DEFAULT_THRESHOLDS,
+  adjuster?: SampleCurrentAdjuster,
+  curtailMarker?: SampleCurtailMarker,
 ): StringDiscreteStat[] {
   const grouped = new Map<string, Sample[]>();
   for (const sample of samples) {
@@ -84,21 +97,31 @@ export function buildStringStats(
   interface Draft {
     stringId: string;
     values: number[];
+    normalizedOnly: number[];
     raws: number[];
     lastSampledAt: string;
     count: number;
+    curtailApplied: boolean;
   }
 
   const drafts: Draft[] = [];
   for (const [stringId, list] of grouped) {
     const sorted = [...list].sort((a, b) => a.sampledAt.localeCompare(b.sampledAt));
     const window = sorted.slice(-8);
+    let curtailApplied = false;
+    const values = window.map((item) => {
+      const source = adjuster ? adjuster(stringId, item) : item.currentA;
+      if (curtailMarker?.(stringId, item)) curtailApplied = true;
+      return normalizeCurrent(source, item.irradianceWm2, config);
+    });
     drafts.push({
       stringId,
-      values: window.map((item) => normalizeCurrent(item.currentA, item.irradianceWm2, config)),
+      values,
+      normalizedOnly: window.map((item) => normalizeCurrent(item.currentA, item.irradianceWm2, config)),
       raws: window.map((item) => item.currentA),
       lastSampledAt: sorted[sorted.length - 1]?.sampledAt ?? '',
       count: list.length,
+      curtailApplied,
     });
   }
 
@@ -111,41 +134,87 @@ export function buildStringStats(
     plantId: '',
     sampleCount: draft.count,
     avgCurrentA: round(mean(draft.raws), 2),
-    avgNormalizedCurrentA: round(mean(draft.values), 3),
+    avgNormalizedCurrentA: round(mean(draft.normalizedOnly), 3),
+    avgAdjustedCurrentA: round(mean(draft.values), 3),
     discreteRate: discreteRate(draft.values),
     currentBiasPercent: 0,
+    curtailApplied: draft.curtailApplied,
     level: 'normal',
     lastSampledAt: draft.lastSampledAt,
   }));
 
-  // 逐集合（汇流箱）计算相对偏差与最终档位
+  // 逐集合（逆变器 + 汇流箱）计算相对偏差与最终档位；
+  // 设备上下文由调用方（sampleStore.hydrateStats）回填后再做同箱基准判定。
+  const pendingBuckets = new Map<string, StringDiscreteStat[]>();
+  for (const stat of stats) {
+    const key = stat.inverterId ? groupKeyOf(stat) : '__pending';
+    const list = pendingBuckets.get(key);
+    if (list) list.push(stat);
+    else pendingBuckets.set(key, [stat]);
+  }
+
+  const applyLevel = (bucket: StringDiscreteStat[]): void => {
+    // 同箱基准：同一逆变器 + 同一汇流箱组串折算后均值；单串集合退回自身
+    const baseline = mean(bucket.map((item) => item.avgAdjustedCurrentA));
+    for (const stat of bucket) {
+      const base = baseline > 0 ? baseline : stat.avgAdjustedCurrentA;
+      stat.currentBiasPercent = currentBiasPercent(stat.avgAdjustedCurrentA, base);
+      const tooFew = stat.sampleCount < config.minSampleCount;
+      const badByRate = levelOf(stat.discreteRate, config);
+      const badByBias =
+        Math.abs(stat.currentBiasPercent) >= config.currentBiasPercent ? 'mismatch' : 'normal';
+      const level: DiscreteLevel =
+        badByRate === 'mismatch' || badByBias === 'mismatch'
+          ? 'mismatch'
+          : badByRate === 'watch'
+            ? 'watch'
+            : tooFew
+              ? 'watch'
+              : 'normal';
+      stat.level = level;
+    }
+  };
+
+  // 上下文尚未回填（纯函数单测场景）时先给一版，hydrate 后会按同箱口径重算
+  for (const bucket of pendingBuckets.values()) applyLevel(bucket);
+
+  return stats;
+}
+
+/**
+ * 设备上下文回填后按同箱基准重算偏差与档位（sampleStore hydrate 时调用）。
+ * 离散率本身不随分组变化，这里只重算同箱均值基准下的电流偏差与最终档位。
+ */
+export function rebaseStringStats(
+  stats: StringDiscreteStat[],
+  config: ThresholdConfig = DEFAULT_THRESHOLDS,
+): StringDiscreteStat[] {
   const buckets = new Map<string, StringDiscreteStat[]>();
   for (const stat of stats) {
-    const key = stat.inverterId ? groupKeyOf(stat) : stat.stringId.slice(0, 0) + '__pending';
+    const key = stat.inverterId ? groupKeyOf(stat) : stat.stringId;
     const list = buckets.get(key);
     if (list) list.push(stat);
     else buckets.set(key, [stat]);
   }
-
-  const globalBaseline = mean(stats.map((item) => item.avgNormalizedCurrentA));
-  for (const stat of stats) {
-    const baseline = globalBaseline > 0 ? globalBaseline : stat.avgNormalizedCurrentA;
-    stat.currentBiasPercent = currentBiasPercent(stat.avgNormalizedCurrentA, baseline);
-    const tooFew = stat.sampleCount < config.minSampleCount;
-    const badByRate = levelOf(stat.discreteRate, config);
-    const badByBias =
-      Math.abs(stat.currentBiasPercent) >= config.currentBiasPercent ? 'mismatch' : 'normal';
-    const level: DiscreteLevel =
-      badByRate === 'mismatch' || badByBias === 'mismatch'
-        ? 'mismatch'
-        : badByRate === 'watch'
-          ? 'watch'
-          : tooFew
+  for (const bucket of buckets.values()) {
+    const baseline = mean(bucket.map((item) => item.avgAdjustedCurrentA));
+    for (const stat of bucket) {
+      const base = baseline > 0 ? baseline : stat.avgAdjustedCurrentA;
+      stat.currentBiasPercent = currentBiasPercent(stat.avgAdjustedCurrentA, base);
+      const tooFew = stat.sampleCount < config.minSampleCount;
+      const badByRate = levelOf(stat.discreteRate, config);
+      const badByBias =
+        Math.abs(stat.currentBiasPercent) >= config.currentBiasPercent ? 'mismatch' : 'normal';
+      stat.level =
+        badByRate === 'mismatch' || badByBias === 'mismatch'
+          ? 'mismatch'
+          : badByRate === 'watch'
             ? 'watch'
-            : 'normal';
-    stat.level = level;
+            : tooFew
+              ? 'watch'
+              : 'normal';
+    }
   }
-
   return stats;
 }
 
@@ -155,9 +224,9 @@ export function rebaseBias(
   config: ThresholdConfig = DEFAULT_THRESHOLDS,
 ): StringDiscreteStat[] {
   if (stats.length === 0) return [];
-  const baseline = mean(stats.map((item) => item.avgNormalizedCurrentA));
+  const baseline = mean(stats.map((item) => item.avgAdjustedCurrentA));
   return stats.map((stat) => {
-    const bias = currentBiasPercent(stat.avgNormalizedCurrentA, baseline);
+    const bias = currentBiasPercent(stat.avgAdjustedCurrentA, baseline);
     const byBias = Math.abs(bias) >= config.currentBiasPercent;
     const level: DiscreteLevel = byBias
       ? 'mismatch'

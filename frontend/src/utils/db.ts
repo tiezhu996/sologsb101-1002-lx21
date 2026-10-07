@@ -12,16 +12,18 @@ import type { Inverter } from '../types/inverter';
 import type { PvString } from '../types/string';
 import type { Sample } from '../types/sample';
 import type { Disposal } from '../types/disposal';
+import type { CurtailPeriod } from '../types/curtail';
 import { DEFAULT_THRESHOLDS, type ThresholdRow } from '../types/settings';
 import { ROW_REVISION, type Revisioned } from '../types/persistence';
 import { normalizeCurrent, discreteRate } from './discrete';
+import { adjustSampleForCurtail, batchEndAt } from './curtail';
 import { nowIso, round, shiftDate, todayDate, uuid } from './format';
 
 /** 数据库名（浏览器 IndexedDB 库名） */
 export const DB_NAME = 'gbpvstring';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 export { ROW_REVISION };
 export type { Revisioned };
@@ -32,6 +34,7 @@ export type InverterRow = Inverter & Revisioned;
 export type StringRow = PvString & Revisioned;
 export type SampleRow = Sample & Revisioned;
 export type DisposalRow = Disposal & Revisioned;
+export type CurtailPeriodDbRow = CurtailPeriod & Revisioned;
 
 class PvStringDatabase extends Dexie {
   plants!: Table<PlantRow, string>;
@@ -41,6 +44,7 @@ class PvStringDatabase extends Dexie {
   samples!: Table<SampleRow, string>;
   disposals!: Table<DisposalRow, string>;
   settings!: Table<ThresholdRow, string>;
+  curtailPeriods!: Table<CurtailPeriodDbRow, string>;
 
   constructor() {
     super(DB_NAME);
@@ -57,7 +61,7 @@ class PvStringDatabase extends Dexie {
 
     // v2：新增 revision 行修订号；组串补充 moduleModel 索引，处置单补充 owner 索引；
     //     采样表补充组合索引便于按组串+时间取窗口
-    this.version(DB_SCHEMA_VERSION)
+    this.version(2)
       .stores({
         plants: 'id, name, gridDate, latitude, capacityMWp',
         arrays: 'id, plantId, code, capacityKw',
@@ -96,6 +100,11 @@ class PvStringDatabase extends Dexie {
           await settings.put({ ...DEFAULT_THRESHOLDS, id: 'threshold', updatedAt: nowIso() });
         }
       });
+
+    // v3：新增 curtailPeriods 表（电站页登记的逆变器限功率时段与限值）
+    this.version(DB_SCHEMA_VERSION).stores({
+      curtailPeriods: 'id, plantId, inverterId, startAt, endAt',
+    });
   }
 }
 
@@ -130,6 +139,8 @@ interface SeedPlan {
       boxes: Array<{ box: string; startSeq: number; count: number; moduleModel: string; seriesCount: number }>;
     }>;
   }>;
+  /** 演示用限功率时段（plantId / inverterId 在播种时按下标回填） */
+  curtailments?: Array<{ arrayIndex: number; inverterIndex: number; startAt: string; endAt: string; limitPercent: number }>;
 }
 
 const SEED_PLANS: SeedPlan[] = [
@@ -182,6 +193,12 @@ const SEED_PLANS: SeedPlan[] = [
           },
         ],
       },
+    ],
+    // 限功率演示：A1 首台逆变器昨日 10:00 起限发 60%（覆盖 10:15 / 10:45 两个采集点）；
+    // A1 第二台逆变器当日限发 70% 且未填结束时间（顺延至当前批次末尾，覆盖全部点）
+    curtailments: [
+      { arrayIndex: 0, inverterIndex: 0, startAt: `${shiftDate(-1)} 10:00`, endAt: `${shiftDate(-1)} 11:30`, limitPercent: 60 },
+      { arrayIndex: 0, inverterIndex: 1, startAt: `${shiftDate(-1)} 08:30`, endAt: '', limitPercent: 70 },
     ],
   },
   {
@@ -245,6 +262,10 @@ async function seedDatabase(): Promise<void> {
   const strings: StringRow[] = [];
   const samples: SampleRow[] = [];
   const disposals: DisposalRow[] = [];
+  const curtailPeriods: CurtailPeriodDbRow[] = [];
+
+  // 演示批次最后一个采集点：未填结束时间的限电时段以此作为「当前批次末尾」
+  const seedBatchEnd = `${shiftDate(-1)} 10:45`;
 
   SEED_PLANS.forEach((plan, plantIndex) => {
     const plantId = `plant-${plantIndex + 1}`;
@@ -284,6 +305,21 @@ async function seedDatabase(): Promise<void> {
           revision: ROW_REVISION,
         });
 
+        // 登记演示限功率时段（未填结束时间者顺延到当前批次末尾）
+        for (const [curtailIndex, curtailPlan] of (plan.curtailments ?? []).entries()) {
+          if (curtailPlan.arrayIndex !== arrayIndex || curtailPlan.inverterIndex !== inverterIndex) continue;
+          curtailPeriods.push({
+            id: `curt-${plantIndex + 1}-${curtailIndex + 1}`,
+            plantId,
+            inverterId,
+            startAt: curtailPlan.startAt,
+            endAt: curtailPlan.endAt,
+            limitPercent: curtailPlan.limitPercent,
+            createdAt: stamp,
+            revision: ROW_REVISION,
+          });
+        }
+
         inverterPlan.boxes.forEach((boxPlan) => {
           for (let offset = 0; offset < boxPlan.count; offset += 1) {
             const seq = boxPlan.startSeq + offset;
@@ -306,8 +342,17 @@ async function seedDatabase(): Promise<void> {
             for (let point = 0; point < 4; point += 1) {
               const irradiance = Math.round(780 + random() * 200);
               const drift = isMismatch ? 0.62 + point * 0.03 : isWatch ? 0.86 + point * 0.01 : 0.97 + random() * 0.06;
-              const currentA = round(baseCurrent * drift, 2);
               const sampledAt = `${shiftDate(-1)} ${String(9 + point).padStart(2, '0')}:${point % 2 === 0 ? '15' : '45'}`;
+              // 限功率会把同一逆变器组串电流一起压低：演示数据按实际限值打折，
+              // 统计侧再按限值折算还原，验证正常组串不会被误推上失配榜
+              const ratio = adjustSampleForCurtail(
+                inverterId,
+                sampledAt,
+                1,
+                curtailPeriods,
+                seedBatchEnd,
+              ).ratio;
+              const currentA = round(baseCurrent * drift * ratio, 2);
               samples.push({
                 id: `smp-${stringId}-${point + 1}`,
                 stringId,
@@ -326,7 +371,7 @@ async function seedDatabase(): Promise<void> {
     });
   });
 
-  // 采集离散率落库：按逆变器+汇流箱分组计算，写入每条采集记录
+  // 采集离散率落库：按逆变器+汇流箱分组，限电时段采集点先按实际限值折算还原再计算
   const byBucket = new Map<string, SampleRow[]>();
   for (const sample of samples) {
     const owner = strings.find((item) => item.id === sample.stringId);
@@ -336,6 +381,7 @@ async function seedDatabase(): Promise<void> {
     if (list) list.push(sample);
     else byBucket.set(key, [sample]);
   }
+  const allBatchEnd = batchEndAt(samples.map((item) => item.sampledAt));
   for (const list of byBucket.values()) {
     const byString = new Map<string, SampleRow[]>();
     for (const sample of list) {
@@ -343,9 +389,24 @@ async function seedDatabase(): Promise<void> {
       if (rows) rows.push(sample);
       else byString.set(sample.stringId, [sample]);
     }
+    // 同一汇流箱内组串互为基准：按逐点折算后电流计算各串离散率
+    const ownerOf = (sample: SampleRow): { inverterId: string } => {
+      const owner = strings.find((item) => item.id === sample.stringId);
+      return { inverterId: owner?.inverterId ?? '' };
+    };
     for (const rows of byString.values()) {
       const rate = discreteRate(
-        rows.map((row) => normalizeCurrent(row.currentA, row.irradianceWm2)),
+        rows.map((row) => {
+          const { inverterId } = ownerOf(row);
+          const { restoredCurrentA } = adjustSampleForCurtail(
+            inverterId,
+            row.sampledAt,
+            row.currentA,
+            curtailPeriods,
+            allBatchEnd,
+          );
+          return normalizeCurrent(restoredCurrentA, row.irradianceWm2);
+        }),
       );
       for (const row of rows) row.discreteRate = rate;
     }
@@ -379,7 +440,7 @@ async function seedDatabase(): Promise<void> {
 
   await db.transaction(
     'rw',
-    [db.plants, db.arrays, db.inverters, db.strings, db.samples, db.disposals, db.settings],
+    [db.plants, db.arrays, db.inverters, db.strings, db.samples, db.disposals, db.settings, db.curtailPeriods],
     async () => {
       await db.plants.bulkPut(plants);
       await db.arrays.bulkPut(arrays);
@@ -388,6 +449,7 @@ async function seedDatabase(): Promise<void> {
       await db.samples.bulkPut(samples);
       await db.disposals.bulkPut(disposals);
       await db.settings.put({ ...DEFAULT_THRESHOLDS, id: 'threshold', updatedAt: stamp });
+      await db.curtailPeriods.bulkPut(curtailPeriods);
     },
   );
 }
@@ -422,11 +484,11 @@ export async function putPlant(row: PlantRow): Promise<void> {
   await db.plants.put(row);
 }
 
-/** 删除电站：级联清理方阵 → 逆变器 → 组串 → 采集 → 处置单 */
+/** 删除电站：级联清理方阵 → 逆变器 → 组串 → 采集 → 处置单 → 限电时段 */
 export async function removePlant(id: string): Promise<void> {
   await db.transaction(
     'rw',
-    [db.plants, db.arrays, db.inverters, db.strings, db.samples, db.disposals],
+    [db.plants, db.arrays, db.inverters, db.strings, db.samples, db.disposals, db.curtailPeriods],
     async () => {
       const arrays = await db.arrays.where('plantId').equals(id).toArray();
       const arrayIds = arrays.map((item) => item.id);
@@ -442,9 +504,13 @@ export async function removePlant(id: string): Promise<void> {
         await db.samples.where('stringId').anyOf(stringIds).delete();
         await db.disposals.where('stringId').anyOf(stringIds).delete();
       }
-      if (inverterIds.length) await db.strings.where('inverterId').anyOf(inverterIds).delete();
+      if (inverterIds.length) {
+        await db.strings.where('inverterId').anyOf(inverterIds).delete();
+        await db.curtailPeriods.where('inverterId').anyOf(inverterIds).delete();
+      }
       if (arrayIds.length) await db.inverters.where('arrayId').anyOf(arrayIds).delete();
       await db.arrays.where('plantId').equals(id).delete();
+      await db.curtailPeriods.where('plantId').equals(id).delete();
       await db.plants.delete(id);
     },
   );
@@ -499,7 +565,7 @@ export async function putInverter(row: InverterRow): Promise<void> {
 }
 
 export async function removeInverter(id: string): Promise<void> {
-  await db.transaction('rw', [db.inverters, db.strings, db.samples, db.disposals], async () => {
+  await db.transaction('rw', [db.inverters, db.strings, db.samples, db.disposals, db.curtailPeriods], async () => {
     const stringRows = await db.strings.where('inverterId').equals(id).toArray();
     const stringIds = stringRows.map((item) => item.id);
     if (stringIds.length) {
@@ -507,6 +573,7 @@ export async function removeInverter(id: string): Promise<void> {
       await db.disposals.where('stringId').anyOf(stringIds).delete();
     }
     await db.strings.where('inverterId').equals(id).delete();
+    await db.curtailPeriods.where('inverterId').equals(id).delete();
     await db.inverters.delete(id);
   });
 }
@@ -577,6 +644,26 @@ export async function removeDisposal(id: string): Promise<void> {
   await db.disposals.delete(id);
 }
 
+/* ============================ 限功率时段 ============================ */
+
+export async function listCurtailPeriods(): Promise<CurtailPeriodDbRow[]> {
+  const rows = await db.curtailPeriods.toArray();
+  return rows.sort((a, b) => b.startAt.localeCompare(a.startAt));
+}
+
+export async function listCurtailPeriodsByPlant(plantId: string): Promise<CurtailPeriodDbRow[]> {
+  const rows = await db.curtailPeriods.where('plantId').equals(plantId).toArray();
+  return rows.sort((a, b) => a.startAt.localeCompare(b.startAt));
+}
+
+export async function putCurtailPeriod(row: CurtailPeriodDbRow): Promise<void> {
+  await db.curtailPeriods.put(row);
+}
+
+export async function removeCurtailPeriod(id: string): Promise<void> {
+  await db.curtailPeriods.delete(id);
+}
+
 /* ============================ 阈值配置 ============================ */
 
 export async function getThresholds(): Promise<ThresholdRow> {
@@ -600,6 +687,7 @@ export interface DatabaseSnapshot {
   strings: PvString[];
   samples: Sample[];
   disposals: Disposal[];
+  curtailPeriods: CurtailPeriod[];
   thresholds: ThresholdRow;
 }
 
@@ -609,13 +697,14 @@ function stripRevision<T extends Revisioned>(row: T): Omit<T, 'revision'> {
 }
 
 export async function exportSnapshot(): Promise<DatabaseSnapshot> {
-  const [plants, arrays, inverters, strings, samples, disposals, thresholds] = await Promise.all([
+  const [plants, arrays, inverters, strings, samples, disposals, curtailPeriods, thresholds] = await Promise.all([
     listPlants(),
     listArrays(),
     listInverters(),
     listStrings(),
     listSamples(),
     listDisposals(),
+    listCurtailPeriods(),
     getThresholds(),
   ]);
   return {
@@ -628,6 +717,7 @@ export async function exportSnapshot(): Promise<DatabaseSnapshot> {
     strings: strings.map(stripRevision),
     samples: samples.map(stripRevision),
     disposals: disposals.map(stripRevision),
+    curtailPeriods: curtailPeriods.map(stripRevision),
     thresholds,
   };
 }
@@ -636,7 +726,7 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
   const rev = <T,>(row: T): T & Revisioned => ({ ...row, revision: ROW_REVISION });
   await db.transaction(
     'rw',
-    [db.plants, db.arrays, db.inverters, db.strings, db.samples, db.disposals, db.settings],
+    [db.plants, db.arrays, db.inverters, db.strings, db.samples, db.disposals, db.settings, db.curtailPeriods],
     async () => {
       await Promise.all([
         db.plants.clear(),
@@ -645,6 +735,7 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
         db.strings.clear(),
         db.samples.clear(),
         db.disposals.clear(),
+        db.curtailPeriods.clear(),
       ]);
       await db.plants.bulkPut((snapshot.plants ?? []).map(rev));
       await db.arrays.bulkPut((snapshot.arrays ?? []).map(rev));
@@ -652,6 +743,7 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
       await db.strings.bulkPut((snapshot.strings ?? []).map(rev));
       await db.samples.bulkPut((snapshot.samples ?? []).map(rev));
       await db.disposals.bulkPut((snapshot.disposals ?? []).map(rev));
+      await db.curtailPeriods.bulkPut((snapshot.curtailPeriods ?? []).map(rev));
       if (snapshot.thresholds) await db.settings.put(snapshot.thresholds);
     },
   );
@@ -661,7 +753,7 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
 export async function resetDatabase(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.plants, db.arrays, db.inverters, db.strings, db.samples, db.disposals, db.settings],
+    [db.plants, db.arrays, db.inverters, db.strings, db.samples, db.disposals, db.settings, db.curtailPeriods],
     async () => {
       await Promise.all([
         db.plants.clear(),
@@ -671,6 +763,7 @@ export async function resetDatabase(): Promise<void> {
         db.samples.clear(),
         db.disposals.clear(),
         db.settings.clear(),
+        db.curtailPeriods.clear(),
       ]);
     },
   );
@@ -679,15 +772,16 @@ export async function resetDatabase(): Promise<void> {
 
 /** 各表行数统计，用于页脚与阈值页概览 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [plants, arrays, inverters, strings, samples, disposals] = await Promise.all([
+  const [plants, arrays, inverters, strings, samples, disposals, curtailPeriods] = await Promise.all([
     db.plants.count(),
     db.arrays.count(),
     db.inverters.count(),
     db.strings.count(),
     db.samples.count(),
     db.disposals.count(),
+    db.curtailPeriods.count(),
   ]);
-  return { plants, arrays, inverters, strings, samples, disposals };
+  return { plants, arrays, inverters, strings, samples, disposals, curtailPeriods };
 }
 
 /** 结构版本信息（/settings 页展示） */

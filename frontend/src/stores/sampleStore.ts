@@ -11,6 +11,7 @@ import {
   listArrays,
   listSamples,
   listStrings,
+  listCurtailPeriods,
   putSample,
   putSamples,
   removeSample,
@@ -19,11 +20,13 @@ import {
   type ArrayRow as DbArrayRow,
   type SampleRow,
   type StringRow,
+  type CurtailPeriodDbRow,
 } from '../utils/db';
-import type { SampleDraft, SampleRow as SampleViewRow, StringDiscreteStat } from '../types/sample';
+import type { Sample, SampleDraft, SampleRow as SampleViewRow, StringDiscreteStat } from '../types/sample';
 import type { ThresholdConfig } from '../types/settings';
 import { DEFAULT_THRESHOLDS } from '../types/settings';
-import { buildStringStats, discreteRate, normalizeCurrent } from '../utils/discrete';
+import { buildStringStats, discreteRate, normalizeCurrent, rebaseStringStats } from '../utils/discrete';
+import { adjustSampleForCurtail, batchEndAt } from '../utils/curtail';
 import { nowIso, uuid } from '../utils/format';
 import { emitChange, subscribeChange } from '../utils/events';
 
@@ -33,6 +36,8 @@ interface SampleStoreState {
   inverters: InverterRow[];
   arrays: DbArrayRow[];
   plants: PlantRow[];
+  /** 限功率时段（电站页登记，统计时按实际限值折算还原） */
+  curtailPeriods: CurtailPeriodDbRow[];
   stats: StringDiscreteStat[];
   thresholds: ThresholdConfig;
   /** 人工标记的可疑组串（跨页共享，排查台与采集页同步） */
@@ -65,9 +70,33 @@ function hydrateStats(
   arrays: DbArrayRow[],
   plants: PlantRow[],
   thresholds: ThresholdConfig,
+  curtailPeriods: CurtailPeriodDbRow[],
 ): StringDiscreteStat[] {
-  const base = buildStringStats(samples, thresholds);
-  return base.map((stat) => {
+  // 当前批次末尾：未填结束时间的限电时段顺延至此
+  const batchEnd = batchEndAt(samples.map((item) => item.sampledAt));
+  const inverterOfString = (stringId: string): string =>
+    strings.find((item) => item.id === stringId)?.inverterId ?? '';
+  // 统计口径：限功率时段采集点先按实际限值折算还原（而非整段剔除），
+  // 再做辐照度归一化，最后与同汇流箱组串互为基准
+  const adjuster = (stringId: string, sample: Sample): number =>
+    adjustSampleForCurtail(
+      inverterOfString(stringId),
+      sample.sampledAt,
+      sample.currentA,
+      curtailPeriods,
+      batchEnd,
+    ).restoredCurrentA;
+  const curtailMarker = (stringId: string, sample: Sample): boolean =>
+    adjustSampleForCurtail(
+      inverterOfString(stringId),
+      sample.sampledAt,
+      sample.currentA,
+      curtailPeriods,
+      batchEnd,
+    ).curtailed;
+
+  const base = buildStringStats(samples, thresholds, adjuster, curtailMarker);
+  const hydrated = base.map((stat) => {
     const owner = strings.find((item) => item.id === stat.stringId);
     const inverter = owner ? inverters.find((item) => item.id === owner.inverterId) : undefined;
     const array = inverter ? arrays.find((item) => item.id === inverter.arrayId) : undefined;
@@ -81,6 +110,8 @@ function hydrateStats(
       plantId: plant?.id ?? '',
     };
   });
+  // 设备上下文回填后按同箱基准重算偏差与档位
+  return rebaseStringStats(hydrated, thresholds);
 }
 
 let unsubscribed: (() => void) | null = null;
@@ -91,6 +122,7 @@ export const useSampleStore = create<SampleStoreState>((set, get) => ({
   inverters: [],
   arrays: [],
   plants: [],
+  curtailPeriods: [],
   stats: [],
   thresholds: DEFAULT_THRESHOLDS,
   markedStringIds: [],
@@ -100,13 +132,14 @@ export const useSampleStore = create<SampleStoreState>((set, get) => ({
   async loadSamples() {
     set({ loading: true });
     try {
-      const [samples, strings, inverters, arrays, plants, thresholdRow] = await Promise.all([
+      const [samples, strings, inverters, arrays, plants, thresholdRow, curtailPeriods] = await Promise.all([
         listSamples(),
         listStrings(),
         listInverters(),
         listArrays(),
         listPlants(),
         getThresholds(),
+        listCurtailPeriods(),
       ]);
       const thresholds: ThresholdConfig = { ...thresholdRow };
       set((state) => ({
@@ -115,8 +148,9 @@ export const useSampleStore = create<SampleStoreState>((set, get) => ({
         inverters,
         arrays,
         plants,
+        curtailPeriods,
         thresholds,
-        stats: hydrateStats(samples, strings, inverters, arrays, plants, thresholds),
+        stats: hydrateStats(samples, strings, inverters, arrays, plants, thresholds, curtailPeriods),
         loading: false,
         error: '',
         markedStringIds: state.markedStringIds.filter((id) =>
@@ -138,7 +172,15 @@ export const useSampleStore = create<SampleStoreState>((set, get) => ({
   setThresholds(config) {
     set((state) => ({
       thresholds: config,
-      stats: hydrateStats(state.samples, state.strings, state.inverters, state.arrays, state.plants, config),
+      stats: hydrateStats(
+        state.samples,
+        state.strings,
+        state.inverters,
+        state.arrays,
+        state.plants,
+        config,
+        state.curtailPeriods,
+      ),
     }));
   },
 
@@ -270,7 +312,7 @@ export const useSampleStore = create<SampleStoreState>((set, get) => ({
   },
 
   async recalcDiscreteRate(stringId) {
-    const { strings, samples } = get();
+    const { strings, samples, curtailPeriods } = get();
     const owner = strings.find((item) => item.id === stringId);
     if (!owner) return 0;
     const peers = strings.filter(
@@ -279,10 +321,34 @@ export const useSampleStore = create<SampleStoreState>((set, get) => ({
     const peerIds = new Set(peers.map((item) => item.id));
     const scope = samples.length > 0 ? samples : await listSamples();
     const targets = scope.filter((item) => peerIds.has(item.stringId));
-    const values = targets.slice(-40).map((item) => normalizeCurrent(item.currentA, item.irradianceWm2));
-    const rate = discreteRate(values.length > 0 ? values : [0]);
-    // 同一汇流箱内组串互为基准：把该汇流箱下全部采集记录的离散率一起回写，保证口径一致
-    await Promise.all(targets.map((item) => putSample({ ...item, discreteRate: rate })));
-    return rate;
+    // 未填结束时间的限电时段顺延到当前批次末尾
+    const batchEnd = batchEndAt(scope.map((item) => item.sampledAt));
+    // 同一汇流箱内组串互为基准：逐组串按最近窗口重算；限电时段先按实际限值折算还原再归一化
+    const byString = new Map<string, SampleRow[]>();
+    for (const item of targets) {
+      const list = byString.get(item.stringId);
+      if (list) list.push(item);
+      else byString.set(item.stringId, [item]);
+    }
+    const updates: Promise<void>[] = [];
+    let ownerRate = 0;
+    for (const [peerId, rows] of byString) {
+      const sorted = [...rows].sort((a, b) => a.sampledAt.localeCompare(b.sampledAt)).slice(-8);
+      const values = sorted.map((item) => {
+        const { restoredCurrentA } = adjustSampleForCurtail(
+          owner.inverterId,
+          item.sampledAt,
+          item.currentA,
+          curtailPeriods,
+          batchEnd,
+        );
+        return normalizeCurrent(restoredCurrentA, item.irradianceWm2);
+      });
+      const rate = discreteRate(values.length > 0 ? values : [0]);
+      for (const row of sorted) updates.push(putSample({ ...row, discreteRate: rate }));
+      if (peerId === stringId) ownerRate = rate;
+    }
+    await Promise.all(updates);
+    return ownerRate;
   },
 }));

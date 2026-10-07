@@ -61,9 +61,13 @@ export interface StringDiscreteStat {
   sampleCount: number;
   avgCurrentA: number;
   avgNormalizedCurrentA: number;
+  /** 限电折算 + 辐照度归一化后的平均电流（A），同箱基准与排查榜判定均使用该口径 */
+  avgAdjustedCurrentA: number;
   discreteRate: number;
   /** 相对同汇流箱均值的偏差百分比 */
   currentBiasPercent: number;
+  /** 窗口内是否存在命中限功率时段的采集点 */
+  curtailApplied: boolean;
   level: DiscreteLevel;
   lastSampledAt: string;
 }

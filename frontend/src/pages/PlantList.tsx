@@ -17,6 +17,7 @@ import {
   InputNumber,
   Popconfirm,
   Row,
+  Select,
   Space,
   Table,
   Tag,
@@ -28,6 +29,7 @@ import {
   PlusOutlined,
   RadarChartOutlined,
   SettingOutlined,
+  ThunderboltOutlined,
 } from '@ant-design/icons';
 import dayjs from 'dayjs';
 import { ROUTES } from '../router/routes';
@@ -35,7 +37,8 @@ import { usePlantStore } from '../stores/plantStore';
 import { useDeviceStore } from '../stores/deviceStore';
 import { useSampleStore } from '../stores/sampleStore';
 import type { ArrayDraft } from '../types/array';
-import type { ArrayRow as DbArrayRow } from '../utils/db';
+import type { ArrayRow as DbArrayRow, CurtailPeriodDbRow } from '../utils/db';
+import { OPEN_ENDED_END_LABEL, validateCurtailDraft, type CurtailDraft } from '../types/curtail';
 import { LATITUDE_BAND_LABEL, latitudeBandOf, type LatitudeBand, type PlantDraft } from '../types/plant';
 import { azimuthDeviation, tiltLabel } from '../types/array';
 import { stringsPerMppt } from '../types/inverter';
@@ -49,6 +52,13 @@ interface PlantFormValues {
   capacityMWp: number;
   gridDate: dayjs.Dayjs;
   latitude: number;
+}
+
+interface CurtailFormValues {
+  inverterId: string;
+  startAt: dayjs.Dayjs;
+  endAt: dayjs.Dayjs | null;
+  limitPercent: number;
 }
 
 const LATITUDE_OPTIONS = (Object.keys(LATITUDE_BAND_LABEL) as LatitudeBand[]).map((key) => ({
@@ -75,10 +85,16 @@ export default function PlantList() {
   const inverters = useDeviceStore((state) => state.inverters);
   const strings = useDeviceStore((state) => state.strings);
 
+  const curtailPeriods = usePlantStore((state) => state.curtailPeriods);
+  const createCurtailPeriod = usePlantStore((state) => state.createCurtailPeriod);
+  const updateCurtailPeriod = usePlantStore((state) => state.updateCurtailPeriod);
+  const deleteCurtailPeriod = usePlantStore((state) => state.deleteCurtailPeriod);
+
   const keyword = useKeywordFilter();
   const filters = useFilterValues(['band']);
   const [plantForm] = Form.useForm<PlantFormValues>();
   const [arrayForm] = Form.useForm<ArrayDraft & { tiltDeg: number }>();
+  const [curtailForm] = Form.useForm<CurtailFormValues>();
   const [plantModal, setPlantModal] = useState<{ open: boolean; editingId: string | null }>({
     open: false,
     editingId: null,
@@ -88,6 +104,11 @@ export default function PlantList() {
     plantId: '',
     editing: null,
   });
+  const [curtailDrawer, setCurtailDrawer] = useState<{
+    open: boolean;
+    plantId: string;
+    editing: CurtailPeriodDbRow | null;
+  }>({ open: false, plantId: '', editing: null });
 
   const bandFilter = filters.band ?? [];
 
@@ -193,6 +214,81 @@ export default function PlantList() {
         };
       });
   }, [arrays, inverters, strings, plants, arrayDrawer.plantId]);
+
+  /** 限功率时段行：拼上逆变器 / 方阵文案 */
+  const curtailRows = useMemo(
+    () =>
+      curtailPeriods
+        .filter((item) => item.plantId === curtailDrawer.plantId)
+        .sort((a, b) => a.startAt.localeCompare(b.startAt))
+        .map((item) => {
+          const inverter = inverters.find((row) => row.id === item.inverterId);
+          const array = inverter ? arrays.find((row) => row.id === inverter.arrayId) : undefined;
+          return {
+            ...item,
+            inverterLabel: `${array?.code ?? '-'} / ${inverter?.model ?? '已删除逆变器'}`,
+            ratedKw: inverter?.ratedKw ?? 0,
+          };
+        }),
+    [curtailPeriods, curtailDrawer.plantId, inverters, arrays],
+  );
+
+  /** 当前电站下逆变器候选 */
+  const inverterOptions = useMemo(() => {
+    const plantArrays = new Set(
+      arrays.filter((item) => item.plantId === curtailDrawer.plantId).map((item) => item.id),
+    );
+    return inverters
+      .filter((item) => plantArrays.has(item.arrayId))
+      .map((item) => {
+        const array = arrays.find((row) => row.id === item.arrayId);
+        return { label: `${array?.code ?? '-'} / ${item.model}（${item.ratedKw}kW）`, value: item.id };
+      });
+  }, [inverters, arrays, curtailDrawer.plantId]);
+
+  /** 打开限功率时段表单 */
+  const openCurtailModal = (editing: CurtailPeriodDbRow | null): void => {
+    if (editing) {
+      curtailForm.setFieldsValue({
+        inverterId: editing.inverterId,
+        startAt: dayjs(editing.startAt, 'YYYY-MM-DD HH:mm'),
+        endAt: editing.endAt ? dayjs(editing.endAt, 'YYYY-MM-DD HH:mm') : null,
+        limitPercent: editing.limitPercent,
+      });
+    } else {
+      curtailForm.resetFields();
+      curtailForm.setFieldsValue({
+        inverterId: inverterOptions[0]?.value,
+        startAt: dayjs().minute(0).second(0),
+        endAt: null,
+        limitPercent: 60,
+      });
+    }
+  };
+
+  const submitCurtail = async (): Promise<void> => {
+    const values = await curtailForm.validateFields();
+    const draft: CurtailDraft = {
+      plantId: curtailDrawer.plantId,
+      inverterId: values.inverterId,
+      startAt: values.startAt.format('YYYY-MM-DD HH:mm'),
+      endAt: values.endAt ? values.endAt.format('YYYY-MM-DD HH:mm') : '',
+      limitPercent: values.limitPercent,
+    };
+    const errors = validateCurtailDraft(draft);
+    if (errors.length > 0) {
+      message.error(errors.join('；'));
+      return;
+    }
+    if (curtailDrawer.editing) {
+      await updateCurtailPeriod(curtailDrawer.editing.id, draft);
+      message.success('限功率时段已更新');
+    } else {
+      await createCurtailPeriod(draft);
+      message.success('限功率时段已登记，排查榜按实际限值折算还原');
+    }
+    curtailForm.resetFields();
+  };
 
   return (
     <div>
@@ -344,6 +440,16 @@ export default function PlantList() {
                       逆变器 {item.inverterCount} 台 · 实采失配 {mismatch}
                     </span>
                     <Space size={4}>
+                      <Button
+                        size="small"
+                        type="link"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          setCurtailDrawer({ open: true, plantId: item.plant.id, editing: null });
+                        }}
+                      >
+                        限功率时段（{curtailPeriods.filter((row) => row.plantId === item.plant.id).length}）
+                      </Button>
                       <Button
                         size="small"
                         type="link"
@@ -547,6 +653,159 @@ export default function PlantList() {
             })
             .join(' · ') || '暂无逆变器'}
         </Typography.Paragraph>
+      </Drawer>
+
+      {/* 限功率时段管理 */}
+      <Drawer
+        title={`限功率时段 · ${plants.find((item) => item.id === curtailDrawer.plantId)?.name ?? ''}`}
+        width={920}
+        open={curtailDrawer.open}
+        onClose={() => {
+          setCurtailDrawer({ open: false, plantId: '', editing: null });
+          curtailForm.resetFields();
+        }}
+      >
+        <Card
+          size="small"
+          title={curtailDrawer.editing ? `编辑限电时段 ${curtailDrawer.editing.limitPercent}%` : '登记限功率时段'}
+          style={{ marginBottom: 12 }}
+        >
+          <Form form={curtailForm} layout="inline" style={{ rowGap: 12 }}>
+            <Form.Item
+              name="inverterId"
+              label="逆变器"
+              rules={[{ required: true, message: '请选择逆变器' }]}
+            >
+              <Select
+                placeholder="选择受限逆变器"
+                style={{ width: 260 }}
+                options={inverterOptions}
+                showSearch
+                optionFilterProp="label"
+              />
+            </Form.Item>
+            <Form.Item
+              name="startAt"
+              label="起始时间"
+              rules={[{ required: true, message: '请选择起始时间' }]}
+            >
+              <DatePicker showTime={{ format: 'HH:mm', minuteStep: 15 }} format="YYYY-MM-DD HH:mm" />
+            </Form.Item>
+            <Form.Item name="endAt" label="结束时间（可跨日）">
+              <DatePicker
+                showTime={{ format: 'HH:mm', minuteStep: 15 }}
+                format="YYYY-MM-DD HH:mm"
+                placeholder={OPEN_ENDED_END_LABEL}
+              />
+            </Form.Item>
+            <Form.Item
+              name="limitPercent"
+              label="限值"
+              rules={[{ required: true, message: '请输入限值比例' }]}
+            >
+              <InputNumber min={1} max={100} step={5} addonAfter="%" style={{ width: 120 }} />
+            </Form.Item>
+            <Form.Item>
+              <Space>
+                <Button
+                  type="primary"
+                  htmlType="submit"
+                  icon={<ThunderboltOutlined />}
+                  onClick={() => void submitCurtail()}
+                >
+                  {curtailDrawer.editing ? '保存修改' : '登记时段'}
+                </Button>
+                {curtailDrawer.editing ? (
+                  <Button
+                    onClick={() => {
+                      setCurtailDrawer((prev) => ({ ...prev, editing: null }));
+                      curtailForm.resetFields();
+                    }}
+                  >
+                    取消编辑
+                  </Button>
+                ) : null}
+              </Space>
+            </Form.Item>
+          </Form>
+          <Typography.Paragraph type="secondary" style={{ marginTop: 12, marginBottom: 0 }}>
+            统计口径：受限时段内的采集点按「实际限值折算」还原电流（实测 ÷ 限值比例）后，再走辐照度归一化与同汇流箱基准，
+            <b>不做整段剔除</b>（整段剔除会导致受限时段离散率无法计算，排查榜漏掉应处置组串）。
+            时段支持跨日；同一逆变器多条时段重叠时取<b>最严限值</b>（比例最小者）；未填结束时间按<b>当前批次末尾</b>（本批最晚采集时间）收口。
+          </Typography.Paragraph>
+        </Card>
+
+        <Table
+          rowKey="id"
+          size="small"
+          dataSource={curtailRows}
+          pagination={false}
+          locale={{ emptyText: <Tag>该电站暂无限功率时段</Tag> }}
+          columns={[
+            {
+              title: '逆变器',
+              dataIndex: 'inverterLabel',
+              width: 260,
+              ellipsis: true,
+            },
+            { title: '起始时间', dataIndex: 'startAt', width: 155 },
+            {
+              title: '结束时间',
+              dataIndex: 'endAt',
+              width: 180,
+              render: (value: string) =>
+                value ? (
+                  value
+                ) : (
+                  <Tag color="orange">{OPEN_ENDED_END_LABEL}</Tag>
+                ),
+            },
+            {
+              title: '限值',
+              dataIndex: 'limitPercent',
+              width: 130,
+              render: (value: number, row) => (
+                <Space size={4}>
+                  <Tag color="volcano">{value}%</Tag>
+                  {row.ratedKw > 0 ? (
+                    <span className="gb-hint">≈ {((row.ratedKw * value) / 100).toFixed(0)} kW</span>
+                  ) : null}
+                </Space>
+              ),
+            },
+            {
+              title: '操作',
+              width: 150,
+              render: (_, row) => (
+                <Space size={4}>
+                  <Button
+                    size="small"
+                    type="link"
+                    icon={<EditOutlined />}
+                    onClick={() => {
+                      setCurtailDrawer((prev) => ({ ...prev, editing: row }));
+                      openCurtailModal(row);
+                    }}
+                  >
+                    编辑
+                  </Button>
+                  <Popconfirm
+                    title="删除该限功率时段？"
+                    description="删除后相关采集点恢复原始读数口径，排查榜将重算。"
+                    okText="删除"
+                    cancelText="取消"
+                    onConfirm={async () => {
+                      await deleteCurtailPeriod(row.id);
+                      message.success('限功率时段已删除');
+                    }}
+                  >
+                    <Button size="small" type="link" danger icon={<DeleteOutlined />} />
+                  </Popconfirm>
+                </Space>
+              ),
+            },
+          ]}
+        />
       </Drawer>
     </div>
   );
