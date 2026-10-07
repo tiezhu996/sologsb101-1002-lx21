@@ -1,0 +1,132 @@
+/* 光伏电站组串失配排查台 · 全局样式
+   冷调浅底 + 光伏绿点缀，工程台账观感，强调数据可读性。 */
+
+:root {
+  --gb-bg: #f2f7f6;
+  --gb-surface: #ffffff;
+  --gb-ink: #12211f;
+  --gb-green: #0f7b6c;
+  --gb-green-soft: #e6f4f1;
+  --gb-blue: #1668dc;
+  --gb-line: rgba(15, 123, 108, 0.16);
+  --gb-danger: #a8071a;
+  --gb-warn: #d46b08;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--gb-bg);
+  color: var(--gb-ink);
+  font-family: 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Source Han Sans SC', system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  opacity: 0.55;
+  background-image:
+    radial-gradient(circle at 8% 12%, rgba(15, 123, 108, 0.08), transparent 40%),
+    radial-gradient(circle at 92% 6%, rgba(22, 104, 220, 0.07), transparent 36%),
+    repeating-linear-gradient(0deg, rgba(18, 33, 31, 0.018) 0 1px, transparent 1px 5px);
+}
+
+#root {
+  position: relative;
+  z-index: 1;
+}
+
+.gb-page-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+
+.gb-page-title {
+  margin: 0 !important;
+}
+
+.gb-stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.gb-card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 14px;
+}
+
+.gb-plant-card {
+  background: var(--gb-surface);
+  border: 1px solid var(--gb-line);
+  border-radius: 10px;
+  padding: 14px;
+  transition: box-shadow 0.18s ease, border-color 0.18s ease, transform 0.18s ease;
+  cursor: pointer;
+}
+
+.gb-plant-card:hover {
+  border-color: var(--gb-green);
+  box-shadow: 0 6px 18px rgba(15, 123, 108, 0.12);
+  transform: translateY(-1px);
+}
+
+.gb-plant-card.is-active {
+  border-color: var(--gb-green);
+  box-shadow: 0 0 0 2px rgba(15, 123, 108, 0.18);
+}
+
+.gb-mono {
+  font-family: 'SFMono-Regular', 'JetBrains Mono', Menlo, Consolas, monospace;
+  font-size: 12.5px;
+}
+
+.gb-hint {
+  color: rgba(18, 33, 31, 0.55);
+  font-size: 12px;
+}
+
+.gb-inline-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.gb-progress-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.gb-rank-row.is-marked {
+  background: #fffbe6;
+}
+
+.gb-scroll {
+  max-height: 420px;
+  overflow: auto;
+}
+
+.ant-layout-sider-children {
+  display: flex;
+  flex-direction: column;
+}
