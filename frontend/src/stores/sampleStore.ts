@@ -9,6 +9,7 @@ import {
   listInverters,
   listPlants,
   listArrays,
+  listCurtailments,
   listSamples,
   listStrings,
   putSample,
@@ -19,12 +20,14 @@ import {
   type ArrayRow as DbArrayRow,
   type SampleRow,
   type StringRow,
+  type CurtailmentRow,
 } from '../utils/db';
 import type { SampleDraft, SampleRow as SampleViewRow, StringDiscreteStat } from '../types/sample';
 import type { ThresholdConfig } from '../types/settings';
 import { DEFAULT_THRESHOLDS } from '../types/settings';
 import { buildStringStats, discreteRate, normalizeCurrent } from '../utils/discrete';
-import { nowIso, uuid } from '../utils/format';
+import { batchEndOf, buildFactorIndex, effectiveRatioAt } from '../utils/curtailment';
+import { round as roundNumber, nowIso, uuid } from '../utils/format';
 import { emitChange, subscribeChange } from '../utils/events';
 
 interface SampleStoreState {
@@ -33,6 +36,7 @@ interface SampleStoreState {
   inverters: InverterRow[];
   arrays: DbArrayRow[];
   plants: PlantRow[];
+  curtailments: CurtailmentRow[];
   stats: StringDiscreteStat[];
   thresholds: ThresholdConfig;
   /** 人工标记的可疑组串（跨页共享，排查台与采集页同步） */
@@ -64,9 +68,25 @@ function hydrateStats(
   inverters: InverterRow[],
   arrays: DbArrayRow[],
   plants: PlantRow[],
+  curtailments: CurtailmentRow[],
   thresholds: ThresholdConfig,
 ): StringDiscreteStat[] {
-  const base = buildStringStats(samples, thresholds);
+  const contextOf = (stringId: string) => {
+    const owner = strings.find((item) => item.id === stringId);
+    const inverter = owner ? inverters.find((item) => item.id === owner.inverterId) : undefined;
+    const array = inverter ? arrays.find((item) => item.id === inverter.arrayId) : undefined;
+    if (!owner) return undefined;
+    return {
+      plantId: array?.plantId ?? '',
+      inverterId: owner.inverterId,
+      combinerBox: owner.combinerBox,
+    };
+  };
+  // 统计链路：原始读数 → 限功率折算 → 辐照度归一化 → 同箱基准
+  const base = buildStringStats(samples, thresholds, {
+    curtailments,
+    resolveContext: contextOf,
+  });
   return base.map((stat) => {
     const owner = strings.find((item) => item.id === stat.stringId);
     const inverter = owner ? inverters.find((item) => item.id === owner.inverterId) : undefined;
@@ -91,6 +111,7 @@ export const useSampleStore = create<SampleStoreState>((set, get) => ({
   inverters: [],
   arrays: [],
   plants: [],
+  curtailments: [],
   stats: [],
   thresholds: DEFAULT_THRESHOLDS,
   markedStringIds: [],
@@ -100,14 +121,16 @@ export const useSampleStore = create<SampleStoreState>((set, get) => ({
   async loadSamples() {
     set({ loading: true });
     try {
-      const [samples, strings, inverters, arrays, plants, thresholdRow] = await Promise.all([
-        listSamples(),
-        listStrings(),
-        listInverters(),
-        listArrays(),
-        listPlants(),
-        getThresholds(),
-      ]);
+      const [samples, strings, inverters, arrays, plants, curtailments, thresholdRow] =
+        await Promise.all([
+          listSamples(),
+          listStrings(),
+          listInverters(),
+          listArrays(),
+          listPlants(),
+          listCurtailments(),
+          getThresholds(),
+        ]);
       const thresholds: ThresholdConfig = { ...thresholdRow };
       set((state) => ({
         samples,
@@ -115,8 +138,9 @@ export const useSampleStore = create<SampleStoreState>((set, get) => ({
         inverters,
         arrays,
         plants,
+        curtailments,
         thresholds,
-        stats: hydrateStats(samples, strings, inverters, arrays, plants, thresholds),
+        stats: hydrateStats(samples, strings, inverters, arrays, plants, curtailments, thresholds),
         loading: false,
         error: '',
         markedStringIds: state.markedStringIds.filter((id) =>
@@ -138,7 +162,15 @@ export const useSampleStore = create<SampleStoreState>((set, get) => ({
   setThresholds(config) {
     set((state) => ({
       thresholds: config,
-      stats: hydrateStats(state.samples, state.strings, state.inverters, state.arrays, state.plants, config),
+      stats: hydrateStats(
+        state.samples,
+        state.strings,
+        state.inverters,
+        state.arrays,
+        state.plants,
+        state.curtailments,
+        config,
+      ),
     }));
   },
 
@@ -234,12 +266,32 @@ export const useSampleStore = create<SampleStoreState>((set, get) => ({
   },
 
   sampleRows() {
-    const { samples, strings, inverters, arrays, plants, thresholds } = get();
+    const { samples, strings, inverters, arrays, plants, curtailments, thresholds } = get();
+    const ownershipOf = (stringId: string) => {
+      const owner = strings.find((item) => item.id === stringId);
+      const inverter = owner ? inverters.find((item) => item.id === owner.inverterId) : undefined;
+      const array = inverter ? arrays.find((item) => item.id === inverter.arrayId) : undefined;
+      if (!owner) return undefined;
+      return { plantId: array?.plantId ?? '', inverterId: owner.inverterId };
+    };
+    const factorIndex = buildFactorIndex(
+      curtailments,
+      samples.map((sample) => ({
+        id: sample.id,
+        stringId: sample.stringId,
+        sampledAt: sample.sampledAt,
+        currentA: sample.currentA,
+      })),
+      ownershipOf,
+    );
     return samples.map((sample) => {
       const owner = strings.find((item) => item.id === sample.stringId);
       const inverter = owner ? inverters.find((item) => item.id === owner.inverterId) : undefined;
       const array = inverter ? arrays.find((item) => item.id === inverter.arrayId) : undefined;
       const plant = array ? plants.find((item) => item.id === array.plantId) : undefined;
+      const factor = factorIndex.get(sample.id);
+      const ratio = factor?.ratio ?? 1;
+      const adjusted = factor?.adjustedCurrentA ?? sample.currentA;
       return {
         ...sample,
         stringCode: owner?.code ?? '已删除组串',
@@ -250,7 +302,9 @@ export const useSampleStore = create<SampleStoreState>((set, get) => ({
         arrayCode: array?.code ?? '-',
         plantId: plant?.id ?? '',
         plantName: plant?.name ?? '未归属电站',
-        normalizedCurrentA: normalizeCurrent(sample.currentA, sample.irradianceWm2, thresholds),
+        adjustedCurrentA: adjusted,
+        curtailRatio: ratio,
+        normalizedCurrentA: normalizeCurrent(adjusted, sample.irradianceWm2, thresholds),
       };
     });
   },
@@ -270,19 +324,51 @@ export const useSampleStore = create<SampleStoreState>((set, get) => ({
   },
 
   async recalcDiscreteRate(stringId) {
-    const { strings, samples } = get();
+    const { strings, samples, inverters, arrays, curtailments } = get();
     const owner = strings.find((item) => item.id === stringId);
     if (!owner) return 0;
+    const plantOfInverter = (inverterId: string): string => {
+      const inverter = inverters.find((item) => item.id === inverterId);
+      const array = inverter ? arrays.find((item) => item.id === inverter.arrayId) : undefined;
+      return array?.plantId ?? '';
+    };
     const peers = strings.filter(
       (item) => item.inverterId === owner.inverterId && item.combinerBox === owner.combinerBox,
     );
     const peerIds = new Set(peers.map((item) => item.id));
     const scope = samples.length > 0 ? samples : await listSamples();
     const targets = scope.filter((item) => peerIds.has(item.stringId));
-    const values = targets.slice(-40).map((item) => normalizeCurrent(item.currentA, item.irradianceWm2));
-    const rate = discreteRate(values.length > 0 ? values : [0]);
-    // 同一汇流箱内组串互为基准：把该汇流箱下全部采集记录的离散率一起回写，保证口径一致
-    await Promise.all(targets.map((item) => putSample({ ...item, discreteRate: rate })));
-    return rate;
+    // 缺结束时间的时段按全部读数的最晚采集时间收口
+    const endBound = batchEndOf(scope.map((item) => item.sampledAt));
+    const plantId = plantOfInverter(owner.inverterId);
+
+    /** 某串折算 + 归一化后的电流向量（限功率折算，不整段剔除） */
+    const vectorOf = (sid: string): number[] =>
+      targets
+        .filter((item) => item.stringId === sid)
+        .map((item) => {
+          const { ratio } = effectiveRatioAt(
+            curtailments,
+            plantId,
+            owner.inverterId,
+            item.sampledAt,
+            endBound,
+          );
+          const adjusted = ratio >= 1 ? item.currentA : roundNumber(item.currentA / ratio, 3);
+          return normalizeCurrent(adjusted, item.irradianceWm2);
+        });
+
+    // 同一汇流箱内组串互为基准：逐串算各自离散率并一起回写，保证口径一致
+    for (const peer of peers) {
+      const vector = vectorOf(peer.id);
+      const rate = discreteRate(vector.length > 0 ? vector : [0]);
+      await Promise.all(
+        targets
+          .filter((item) => item.stringId === peer.id)
+          .map((item) => putSample({ ...item, discreteRate: rate })),
+      );
+    }
+    const currentVector = vectorOf(stringId);
+    return discreteRate(currentVector.length > 0 ? currentVector : [0]);
   },
 }));

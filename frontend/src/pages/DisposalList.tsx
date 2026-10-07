@@ -66,6 +66,7 @@ export default function DisposalList() {
   const submitRetest = useDisposalStore((state) => state.submitRetest);
   const deleteDisposal = useDisposalStore((state) => state.deleteDisposal);
   const nextStates = useDisposalStore((state) => state.nextStates);
+  const baselineOfString = useDisposalStore((state) => state.baselineOfString);
 
   const strings = useDeviceStore((state) => state.strings);
   const inverters = useDeviceStore((state) => state.inverters);
@@ -82,7 +83,14 @@ export default function DisposalList() {
         const inverter = string ? inverters.find((item) => item.id === string.inverterId) : undefined;
         const array = inverter ? arrays.find((item) => item.id === inverter.arrayId) : undefined;
         const plant = array ? plants.find((item) => item.id === array.plantId) : undefined;
-        const baseline = string ? (baselines[`${string.inverterId}::${string.combinerBox}`] ?? 9.4) : 9.4;
+        // 优先当前同箱基准（限功率折算口径），无读数时回退派单初始基准
+        const liveBaseline = string ? (baselines[`${string.inverterId}::${string.combinerBox}`] ?? 0) : 0;
+        const baseline =
+          liveBaseline > 0
+            ? liveBaseline
+            : disposal.initialBaselineCurrentA > 0
+              ? disposal.initialBaselineCurrentA
+              : 9.4;
         return {
           ...disposal,
           stringCode: string?.code ?? '已删除组串',
@@ -147,9 +155,10 @@ export default function DisposalList() {
           }%`,
           value: item.id,
           rate: stat?.discreteRate ?? 0,
+          baseline: stat?.boxBaselineCurrentA ?? baselineOfString(item.id),
         };
       }),
-    [strings, inverters, stats],
+    [strings, inverters, stats, baselineOfString],
   );
 
   const openCreate = (): void => {
@@ -161,6 +170,7 @@ export default function DisposalList() {
       owner: '李文波',
       dueDate: dayjs(shiftDate(3)),
       initialDiscreteRate: stringOptions[0]?.rate ?? 0,
+      initialBaselineCurrentA: stringOptions[0]?.baseline ?? 0,
     });
   };
 
@@ -172,6 +182,7 @@ export default function DisposalList() {
       owner: values.owner,
       dueDate: values.dueDate.format('YYYY-MM-DD'),
       initialDiscreteRate: values.initialDiscreteRate,
+      initialBaselineCurrentA: values.initialBaselineCurrentA,
     });
     message.success('处置单已创建（状态：待处理）');
     setCreateOpen(false);
@@ -190,12 +201,11 @@ export default function DisposalList() {
     if (!retestTarget) return;
     const values = await retestForm.validateFields();
     const cleared = await submitRetest(retestTarget.id, values.retestCurrentA);
-    const string = strings.find((item) => item.id === retestTarget.stringId);
-    const baseline = string ? (baselines[`${string.inverterId}::${string.combinerBox}`] ?? 9.4) : 9.4;
+    const baseline = baselineOfString(retestTarget.stringId);
     if (cleared) {
-      message.success(`复测通过，已消缺（基准电流 ${baseline.toFixed(2)} A，达 95% 以上）`);
+      message.success(`复测通过，已消缺（同箱基准电流 ${baseline.toFixed(2)} A，达 95% 以上）`);
     } else {
-      message.warning(`复测未达基准电流 ${baseline.toFixed(2)} A 的 95%，建议二次处置`);
+      message.warning(`复测未达同箱基准电流 ${baseline.toFixed(2)} A 的 95%，建议二次处置`);
     }
     setRetestTarget(null);
     retestForm.resetFields();
@@ -285,7 +295,7 @@ export default function DisposalList() {
             size="small"
             dataSource={filtered}
             pagination={{ pageSize: 10, size: 'small' }}
-            scroll={{ x: 1180 }}
+            scroll={{ x: 1310 }}
             columns={[
               {
                 title: '类型',
@@ -326,6 +336,13 @@ export default function DisposalList() {
                 render: (value: number) => (
                   <DiscreteBadge rate={value} thresholds={thresholds} size="small" />
                 ),
+              },
+              {
+                title: '派单同箱基准',
+                dataIndex: 'initialBaselineCurrentA',
+                width: 130,
+                render: (value: number) =>
+                  value > 0 ? formatCurrent(value) : <span className="gb-hint">未登记</span>,
               },
               { title: '责任人', dataIndex: 'owner', width: 100 },
               { title: '要求完成', dataIndex: 'dueDate', width: 120 },
@@ -374,11 +391,9 @@ export default function DisposalList() {
                         type="link"
                         onClick={() => {
                           setRetestTarget(row);
-                          const string = strings.find((item) => item.id === row.stringId);
-                          const baseline = string
-                            ? (baselines[`${string.inverterId}::${string.combinerBox}`] ?? 9.4)
-                            : 9.4;
-                          retestForm.setFieldsValue({ retestCurrentA: Number(baseline.toFixed(2)) });
+                          retestForm.setFieldsValue({
+                            retestCurrentA: Number(baselineOfString(row.stringId).toFixed(2)),
+                          });
                         }}
                       >
                         复测回填
@@ -470,7 +485,10 @@ export default function DisposalList() {
               options={stringOptions}
               onChange={(value) => {
                 const hit = stringOptions.find((item) => item.value === value);
-                form.setFieldValue('initialDiscreteRate', hit?.rate ?? 0);
+                form.setFieldsValue({
+                  initialDiscreteRate: hit?.rate ?? 0,
+                  initialBaselineCurrentA: hit?.baseline ?? 0,
+                });
               }}
             />
           </Form.Item>
@@ -489,8 +507,18 @@ export default function DisposalList() {
           <Form.Item name="dueDate" label="要求完成日期" rules={[{ required: true, message: '请选择日期' }]}>
             <DatePicker style={{ width: '100%' }} />
           </Form.Item>
-          <Form.Item name="initialDiscreteRate" label="派单离散率（%）">
+          <Form.Item
+            name="initialDiscreteRate"
+            label="派单离散率（%，限功率折算口径）"
+          >
             <InputNumber min={0} max={100} step={0.1} style={{ width: '100%' }} />
+          </Form.Item>
+          <Form.Item
+            name="initialBaselineCurrentA"
+            label="派单同箱基准电流（A）"
+            extra="原始读数经限值折算与辐照度归一化后的同箱均值，复测达其 95% 判消缺"
+          >
+            <InputNumber min={0} max={30} step={0.01} style={{ width: '100%' }} />
           </Form.Item>
         </Form>
       </Drawer>
@@ -544,7 +572,11 @@ export default function DisposalList() {
         {retestTarget ? (
           <Form form={retestForm} layout="vertical">
             <Typography.Paragraph type="secondary">
-              基准电流 = 同汇流箱典型工作电流，复测值达到基准 95% 即判定消缺。
+              同箱基准电流 = 同汇流箱组串原始读数经限功率折算、辐照度归一化后的平均电流；复测值达到基准 95%
+              即判定消缺。
+              {retestTarget.initialBaselineCurrentA > 0
+                ? ` 派单时登记基准 ${retestTarget.initialBaselineCurrentA.toFixed(2)} A。`
+                : ''}
             </Typography.Paragraph>
             <Form.Item
               name="retestCurrentA"

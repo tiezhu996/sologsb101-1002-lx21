@@ -344,6 +344,19 @@ export default function SampleEntry() {
                     render: (value: number) => formatCurrent(value),
                   },
                   {
+                    title: '限功率折算',
+                    width: 120,
+                    render: (_, row) =>
+                      row.curtailRatio < 1 ? (
+                        <Space size={4}>
+                          <Tag color="orange">限{Math.round(row.curtailRatio * 100)}%</Tag>
+                          <span>{formatCurrent(row.adjustedCurrentA)}</span>
+                        </Space>
+                      ) : (
+                        <span className="gb-hint">未受限</span>
+                      ),
+                  },
+                  {
                     title: '辐照度',
                     dataIndex: 'irradianceWm2',
                     width: 110,
@@ -632,7 +645,8 @@ export default function SampleEntry() {
         )}
 
         <Typography.Paragraph type="secondary" style={{ marginTop: 12 }}>
-          提示：批量录入后系统按汇流箱分组重算离散率，离散率 = 组串归一化电流标准差 / 均值 × 100%。当前可疑偏差阈值{' '}
+          提示：批量录入后系统按汇流箱分组重算离散率，统计链路为「原始读数 → 限功率按实际限值折算（不整段剔除）→
+          辐照度归一化 → 同箱基准」，离散率 = 组串归一化电流标准差 / 均值 × 100%。限功率时段在电站页登记。当前可疑偏差阈值{' '}
           {formatPercent(thresholds.currentBiasPercent, 0)}。
         </Typography.Paragraph>
       </Drawer>

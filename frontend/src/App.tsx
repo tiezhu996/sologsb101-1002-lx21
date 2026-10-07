@@ -31,6 +31,7 @@ import { usePlantStore } from './stores/plantStore';
 import { useSampleStore } from './stores/sampleStore';
 import { useDisposalStore } from './stores/disposalStore';
 import { useDeviceStore } from './stores/deviceStore';
+import { useCurtailStore } from './stores/curtailStore';
 
 const { Header, Sider, Content, Footer } = Layout;
 
@@ -66,6 +67,8 @@ export default function App() {
   const subscribeDisposals = useDisposalStore((state) => state.subscribe);
   const loadDevices = useDeviceStore((state) => state.loadDevices);
   const subscribeDevices = useDeviceStore((state) => state.subscribe);
+  const loadCurtailments = useCurtailStore((state) => state.loadCurtailments);
+  const subscribeCurtailments = useCurtailStore((state) => state.subscribe);
 
   const stats = useSampleStore((state) => state.stats);
   const markedStringIds = useSampleStore((state) => state.markedStringIds);
@@ -81,12 +84,23 @@ export default function App() {
       subscribeSamples();
       subscribeDisposals();
       subscribeDevices();
-      await Promise.all([loadSamples(), loadDisposals(), loadDevices()]);
+      subscribeCurtailments();
+      await Promise.all([loadSamples(), loadDisposals(), loadDevices(), loadCurtailments()]);
     })();
     return () => {
       cancelled = true;
     };
-  }, [bootstrap, loadSamples, loadDisposals, loadDevices, subscribeSamples, subscribeDisposals, subscribeDevices]);
+  }, [
+    bootstrap,
+    loadSamples,
+    loadDisposals,
+    loadDevices,
+    loadCurtailments,
+    subscribeSamples,
+    subscribeDisposals,
+    subscribeDevices,
+    subscribeCurtailments,
+  ]);
 
   useEffect(() => {
     if (plantError) message.error(`本地数据库异常：${plantError}`);

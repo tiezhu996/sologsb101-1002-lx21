@@ -34,6 +34,7 @@ import { ROUTES } from '../router/routes';
 import { usePlantStore } from '../stores/plantStore';
 import { useDeviceStore } from '../stores/deviceStore';
 import { useSampleStore } from '../stores/sampleStore';
+import { useCurtailStore } from '../stores/curtailStore';
 import type { ArrayDraft } from '../types/array';
 import type { ArrayRow as DbArrayRow } from '../utils/db';
 import { LATITUDE_BAND_LABEL, latitudeBandOf, type LatitudeBand, type PlantDraft } from '../types/plant';
@@ -43,6 +44,7 @@ import { formatPower, share } from '../utils/unit';
 import StatBadge from '../components/common/StatBadge';
 import EmptyPanel from '../components/common/EmptyPanel';
 import FilterBar, { useFilterValues, useKeywordFilter } from '../components/common/FilterBar';
+import CurtailmentDrawer from '../components/curtailment/CurtailmentDrawer';
 
 interface PlantFormValues {
   name: string;
@@ -72,8 +74,10 @@ export default function PlantList() {
   const deleteArray = usePlantStore((state) => state.deleteArray);
 
   const stats = useSampleStore((state) => state.stats);
+  const samples = useSampleStore((state) => state.samples);
   const inverters = useDeviceStore((state) => state.inverters);
   const strings = useDeviceStore((state) => state.strings);
+  const curtailments = useCurtailStore((state) => state.curtailments);
 
   const keyword = useKeywordFilter();
   const filters = useFilterValues(['band']);
@@ -87,6 +91,10 @@ export default function PlantList() {
     open: false,
     plantId: '',
     editing: null,
+  });
+  const [curtailDrawer, setCurtailDrawer] = useState<{ open: boolean; plantId: string }>({
+    open: false,
+    plantId: '',
   });
 
   const bandFilter = filters.band ?? [];
@@ -193,6 +201,40 @@ export default function PlantList() {
         };
       });
   }, [arrays, inverters, strings, plants, arrayDrawer.plantId]);
+
+  /** 各电站限功率时段数与当前批次末尾（最晚采集时间，未填结束时间收口用） */
+  const curtailMeta = useMemo(() => {
+    const stringPlant = new Map<string, string>();
+    for (const str of strings) {
+      const inverter = inverters.find((item) => item.id === str.inverterId);
+      const array = inverter ? arrays.find((item) => item.id === inverter.arrayId) : undefined;
+      if (array) stringPlant.set(str.id, array.plantId);
+    }
+    const batchEnds = new Map<string, string>();
+    for (const sample of samples) {
+      const plantId = stringPlant.get(sample.stringId);
+      if (!plantId) continue;
+      if (sample.sampledAt > (batchEnds.get(plantId) ?? '')) {
+        batchEnds.set(plantId, sample.sampledAt);
+      }
+    }
+    const counts = new Map<string, number>();
+    for (const item of curtailments) {
+      counts.set(item.plantId, (counts.get(item.plantId) ?? 0) + 1);
+    }
+    return { batchEnds, counts };
+  }, [strings, inverters, arrays, samples, curtailments]);
+
+  /** 限功率抽屉所属电站与该电站逆变器 */
+  const curtailPlant = plants.find((item) => item.id === curtailDrawer.plantId) ?? null;
+  const curtailPlantArrays = useMemo(
+    () => new Set(arrays.filter((item) => item.plantId === curtailDrawer.plantId).map((item) => item.id)),
+    [arrays, curtailDrawer.plantId],
+  );
+  const curtailInverters = useMemo(
+    () => inverters.filter((item) => curtailPlantArrays.has(item.arrayId)),
+    [inverters, curtailPlantArrays],
+  );
 
   return (
     <div>
@@ -344,6 +386,21 @@ export default function PlantList() {
                       逆变器 {item.inverterCount} 台 · 实采失配 {mismatch}
                     </span>
                     <Space size={4}>
+                      <Button
+                        size="small"
+                        type="link"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          setCurtailDrawer({ open: true, plantId: item.plant.id });
+                        }}
+                      >
+                        限功率时段
+                        {curtailMeta.counts.get(item.plant.id) ? (
+                          <Tag color="orange" style={{ marginInlineStart: 6 }}>
+                            {curtailMeta.counts.get(item.plant.id)}
+                          </Tag>
+                        ) : null}
+                      </Button>
                       <Button
                         size="small"
                         type="link"
@@ -548,6 +605,15 @@ export default function PlantList() {
             .join(' · ') || '暂无逆变器'}
         </Typography.Paragraph>
       </Drawer>
+
+      {/* 限功率时段管理 */}
+      <CurtailmentDrawer
+        open={curtailDrawer.open}
+        plant={curtailPlant}
+        inverters={curtailInverters}
+        batchEnd={curtailMeta.batchEnds.get(curtailDrawer.plantId) ?? ''}
+        onClose={() => setCurtailDrawer({ open: false, plantId: '' })}
+      />
     </div>
   );
 }

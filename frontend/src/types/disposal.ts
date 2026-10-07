@@ -40,8 +40,10 @@ export interface Disposal {
   dueDate: string;
   /** 复测电流（A），已复测时必填 */
   retestCurrentA: number | null;
-  /** 派工时登记的初始离散率（%） */
+  /** 派工时登记的初始离散率（%，已按限功率折算口径计算） */
   initialDiscreteRate: number;
+  /** 派工时登记的同汇流箱基准电流（A，归一化口径，已折算） */
+  initialBaselineCurrentA: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -53,6 +55,8 @@ export interface DisposalDraft {
   owner: string;
   dueDate: string;
   initialDiscreteRate: number;
+  /** 同箱基准电流；未提供时由 store 按当前统计补齐 */
+  initialBaselineCurrentA?: number;
 }
 
 /** 处置单行数据（带组串上下文与消缺判定） */

@@ -135,6 +135,7 @@ export default function DiagnoseBoard() {
         owner,
         dueDate: shiftDate(3),
         initialDiscreteRate: stat?.discreteRate ?? 0,
+        initialBaselineCurrentA: stat?.boxBaselineCurrentA ?? 0,
       });
     }
     message.success(`已为 ${selectedIds.length} 串批量生成清洗处置单（重复派单已自动跳过）`);
@@ -297,6 +298,11 @@ export default function DiagnoseBoard() {
                           {row.combinerBox} · {row.stringCode}
                         </span>
                         {markedStringIds.includes(row.stringId) ? <StarOutlined style={{ color: '#faad14' }} /> : null}
+                        {row.curtailedSampleCount > 0 ? (
+                          <Tag color="orange" title={`窗口内 ${row.curtailedSampleCount} 个读数已按限值折算回升`}>
+                            限{Math.round(row.curtailRatioMin * 100)}%
+                          </Tag>
+                        ) : null}
                       </Space>
                     ),
                   },
@@ -327,6 +333,12 @@ export default function DiagnoseBoard() {
                   {
                     title: '平均电流',
                     dataIndex: 'avgCurrentA',
+                    width: 105,
+                    render: (value: number) => formatCurrent(value),
+                  },
+                  {
+                    title: '同箱基准',
+                    dataIndex: 'boxBaselineCurrentA',
                     width: 105,
                     render: (value: number) => formatCurrent(value),
                   },
@@ -370,6 +382,7 @@ export default function DiagnoseBoard() {
                               owner: '张启明',
                               dueDate: shiftDate(5),
                               initialDiscreteRate: row.discreteRate,
+                              initialBaselineCurrentA: row.boxBaselineCurrentA,
                             });
                             message.success('已生成处置单');
                             navigate('/disposals');
@@ -487,6 +500,14 @@ export default function DiagnoseBoard() {
               </Descriptions.Item>
               <Descriptions.Item label="电流偏差">
                 {formatPercent(target.currentBiasPercent, 2, true)}
+              </Descriptions.Item>
+              <Descriptions.Item label="同箱基准电流">
+                {formatCurrent(target.boxBaselineCurrentA)}
+                {target.curtailedSampleCount > 0 ? (
+                  <Tag color="orange" style={{ marginInlineStart: 6 }}>
+                    含限功率折算（最严 {Math.round(target.curtailRatioMin * 100)}%）
+                  </Tag>
+                ) : null}
               </Descriptions.Item>
               <Descriptions.Item label="未闭环处置">
                 {openDisposalsOf(target.stringId)} 单
@@ -613,6 +634,7 @@ export default function DiagnoseBoard() {
                     owner: '王慧敏',
                     dueDate: shiftDate(5),
                     initialDiscreteRate: target.discreteRate,
+                    initialBaselineCurrentA: target.boxBaselineCurrentA,
                   }).then(() => {
                     message.success('已生成处置单');
                     navigate('/disposals');

@@ -46,7 +46,11 @@ export interface SampleRow extends Sample, Revisioned {
   arrayCode: string;
   plantId: string;
   plantName: string;
-  /** 辐照度归一化后的电流（折算到 1000 W/m²） */
+  /** 限功率折算后的电流（A）；未受限时段等于原始电流 */
+  adjustedCurrentA: number;
+  /** 该读数生效的限值比例（1 表示未限功率） */
+  curtailRatio: number;
+  /** 辐照度归一化后的电流（基于折算后电流，折算到 1000 W/m²） */
   normalizedCurrentA: number;
 }
 
@@ -59,9 +63,15 @@ export interface StringDiscreteStat {
   arrayId: string;
   plantId: string;
   sampleCount: number;
+  /** 窗口内被限功率折算过的读数条数 */
+  curtailedSampleCount: number;
+  /** 窗口内最严限值比例（1 表示该串统计窗口未受限） */
+  curtailRatioMin: number;
   avgCurrentA: number;
   avgNormalizedCurrentA: number;
   discreteRate: number;
+  /** 同汇流箱基准电流（箱内各组串归一化电流均值，A） */
+  boxBaselineCurrentA: number;
   /** 相对同汇流箱均值的偏差百分比 */
   currentBiasPercent: number;
   level: DiscreteLevel;
